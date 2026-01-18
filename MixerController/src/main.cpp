@@ -70,5 +70,16 @@ void loop() {
     // USB Serial Listener (For Testing)
     AppData.handleIncomingData(Serial);
     
+    // Heartbeat & Sync Mechanism
+    // Sends full state every 2 seconds. 
+    // This serves two purposes:
+    // 1. Syncs Mixer Body immediately on startup.
+    // 2. Acts as "Heartbeat". If Mixer Body stops receiving this, it knows system is OFF.
+    static unsigned long last_heartbeat = 0;
+    if (millis() - last_heartbeat > 2000) {
+        last_heartbeat = millis();
+        AppData.sendUpdate();
+    }
+    
     delay(5);
 }

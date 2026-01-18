@@ -39,6 +39,7 @@ bool relayMicState = false;
 
 // Bluetooth State
 bool isBluetoothActive = false;
+unsigned long lastPacketTime = 0;
 
 // ------------------- FUNCTIONS -------------------
 
@@ -100,6 +101,10 @@ void processPacket(String& input) {
         Serial.println(error.c_str());
         return;
     }
+    
+    // Valid packet received -> Reset Timeout
+    extern unsigned long lastPacketTime;
+    lastPacketTime = millis();
 
     if (doc.containsKey("mv")) currentMusicVol = doc["mv"];
     if (doc.containsKey("cv")) currentMicVol = doc["cv"];
@@ -171,15 +176,18 @@ void loop() {
         input.trim();
         if (input.length() > 0) {
             processPacket(input);
-            
-            // Send Ack? User requested "Two way".
-            // Ideally we only Ack if we are asked, or we might flood.
-            // But getting a state is rare.
-            // Let's print local debug mainly.
-            // If we want to send ACK to screen, user needs to implement receiving on Screen side properly.
-            // Screen handles `?` to send. It does not seemingly handle ACKs.
-            // We will stick to receiving for now unless protocol changes.
         }
+    }
+    
+    // Timeout Check (System OFF logic)
+    // If no packet from screen for > 60 seconds (Increased for Safety), assume screen is OFF.
+    if (isBluetoothActive && (millis() - lastPacketTime > 60000)) {
+        Serial.println("Timeout: Screen OFF (No Heartbeat). Stopping Bluetooth.");
+        a2dp_sink.end();
+        isBluetoothActive = false;
+        
+        // Optional: Switch relay to line-in safely?
+        // digitalWrite(PIN_RELAY_MUSIC, HIGH); 
     }
 
     delay(10);
