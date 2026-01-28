@@ -144,8 +144,39 @@ void bsp_touch_read(lv_indev_drv_t * indriver, lv_indev_data_t * data) {
         Serial.printf("Touch Raw: %d,%d -> Mapped: %d,%d\n", 
             ts.points[0].x, ts.points[0].y, data->point.x, data->point.y);
         */
-    } else {
         data->state = LV_INDEV_STATE_REL;
         // Serial.println("Touch: None");
     }
+}
+
+// Read CH422G Input Register (0x26)
+// Returns the full byte. 
+// DI0 is likely Bit 0 or Bit something. 
+// Based on docs: EXIO0 is DI0.
+int bsp_get_input_state() {
+    Wire.beginTransmission(0x24); // CH422G Address
+    Wire.write(0x26);             // Input Register Command
+    if (Wire.endTransmission() != 0) {
+        return -1; // Error
+    }
+    
+    Wire.requestFrom(0x24, 1);
+    if (Wire.available()) {
+        return Wire.read();
+    }
+    return -1;
+}
+
+// Control Backlight via CH422G (Bit 4 of Enable Register?)
+// Actually, earlier in code we saw: enable_backlight() uses specific command.
+// See enable_backlight implementation above (it was static/hidden?).
+// Let's expose it.
+void bsp_set_backlight(bool on) {
+    Wire.beginTransmission(0x38);
+    if (on) {
+        Wire.write(0xFF); // All Pins HIGH (Backlight ON, Touch Reset Released)
+    } else {
+        Wire.write(0x00); // All Pins LOW (Backlight OFF, Touch held in Reset)
+    }
+    Wire.endTransmission();
 }

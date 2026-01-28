@@ -71,13 +71,76 @@ void loop() {
     AppData.handleIncomingData(Serial);
     
     // Heartbeat & Sync Mechanism
-    // Sends full state every 2 seconds. 
-    // This serves two purposes:
-    // 1. Syncs Mixer Body immediately on startup.
-    // 2. Acts as "Heartbeat". If Mixer Body stops receiving this, it knows system is OFF.
     static unsigned long last_heartbeat = 0;
     if (millis() - last_heartbeat > 2000) {
         last_heartbeat = millis();
+        
+        // --- POWER SENSING LOGIC (USB CHARGER) ---
+        // Read DI0 from CH422G (Bit 0 of Input Register 0x26)
+        int input_reg = bsp_get_input_state();
+        
+        static bool system_was_on = true; // State tracking
+        static int debounce_counter = 0;  // Simple debounce
+        
+        if (input_reg != -1) {
+            // Check Bit 0 (DI0) - Active HIGH (5V from USB)
+            bool switch_is_on = (input_reg & 0x01); 
+            
+            if (switch_is_on) {
+                // DETECTED ON
+                if (!system_was_on) {
+                    debounce_counter++;
+                    // Faster Wake-Up: > 0 means 1 cycle (approx 2s latency).
+                    // This is enough to let speakers click on safely.
+                    if (debounce_counter > 0) { 
+                         // Turn System ON
+                         Serial.println("Power: Switch ON detected. Waking up.");
+                         bsp_set_backlight(true);
+                         
+                         // UX UPGRADE: 
+                         // Show "Loading..." Screen (Screen 3) instead of jump to Main.
+                         // Screen 3 already has a logic to wait 2s then go to Screen 1.
+                         // This visualizes the "Anti-Pop" safety delay perfectly to the user.
+                         _ui_screen_change(&ui_Screen3, LV_SCR_LOAD_ANIM_NONE, 0, 0, &ui_Screen3_screen_init);
+                         
+                         system_was_on = true;
+                         debounce_counter = 0;
+                         // Optimization: Trigger immediate update
+                         AppData.sendUpdate();
+                    }
+                } else {
+                    debounce_counter = 0;
+                }
+            } else {
+                // DETECTED OFF
+                if (system_was_on) {
+                    debounce_counter++;
+                    if (debounce_counter > 0) { // Fast Off (1 cycle = 2s delay max)
+                        Serial.println("Power: Switch OFF detected. Shutting down.");
+                        
+                        // 1. Turn off Screen
+                        bsp_set_backlight(false);
+                        
+                        // 2. SAFETY: Turn off Bluetooth Relay (Switch to Line-In)
+                        AppData.music_relay_state = false; 
+                        // AppData.music_volume = 0; // Optional: Volume Reset?
+                        
+                        // 3. Send Update to Mixer Body immediately
+                        AppData.sendUpdate();
+                        
+                        system_was_on = false;
+                        debounce_counter = 0;
+                    }
+                } else {
+                    debounce_counter = 0;
+                }
+            }
+        }
+        
+        // Regular Heartbeat (Keeps Mixer Body alive)
+        // Even if screen is off, we keep sending heartbeat so Mixer Body doesn't timeout
+        // and kill Bluetooth on its own (though we just killed it explicitly).
+        // Sending updates ensures sync.
         AppData.sendUpdate();
     }
     

@@ -1,7 +1,5 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
-#include "BluetoothA2DPSink.h"
-#include "M62429_Driver.h"
 
 // ------------------- PIN DEFINITIONS -------------------
 // RS485
@@ -9,185 +7,123 @@
 #define RS485_RX 17
 #define RS485_DE 4
 
-// Relays (Active High)
+// Relays (Active High/Low depends on wiring, assuming same logic as production)
+// Production logic: 
+// Music: LOW = Bluetooth, HIGH = Line-In
+// Mic: LOW = Wired, HIGH = Wireless
 #define PIN_RELAY_MUSIC 12
 #define PIN_RELAY_MIC   14
 
-// Volume (M62429) - Shared Clock
-#define M62429_CLK 22
-#define M62429_DATA_MUSIC 21
-#define M62429_DATA_MIC   19
-
-// I2S (For Bluetooth DAC)
-#define I2S_BCK  26
-#define I2S_LRCK 27
-#define I2S_DOUT 25
-
-// ------------------- OBJECTS -------------------
-BluetoothA2DPSink a2dp_sink;
-
-// Volume Drivers (One for Music, One for Mic)
-// They share the CLOCK pin.
-M62429 volMusic(M62429_DATA_MUSIC, M62429_CLK);
-M62429 volMic(M62429_DATA_MIC, M62429_CLK);
-
 // ------------------- STATE -------------------
-int currentMusicVol = 0;
-int currentMicVol = 0;
-bool relayMusicState = false;
-bool relayMicState = false;
-
-// Bluetooth State
-bool isBluetoothActive = false;
-unsigned long lastPacketTime = 0;
+bool relayMusicState = false; // 0 = Line-In (High), 1 = Bluetooth (Low) - based on logic in prod
+bool relayMicState = false;   // 0 = Wired (Low), 1 = Wireless (High)
 
 // ------------------- FUNCTIONS -------------------
 
 void updateRelays() {
-    // Logic Correction based on User Feedback:
-    // Music Relay: Bluetooth is connected to NC (Normally Closed).
-    //              Line-In is connected to NO (Normally Open).
-    //              Therefore: LOW = Bluetooth, HIGH = Line-In.
-    
-    // Mic Relay: Wired is NC, Wireless is NO (User can swap HW, but we assume this standard).
-    //            Therefore: LOW = Wired, HIGH = Wireless.
+    // Music Relay Logic from Production:
+    // if relayMusicState (Bluetooth requested) -> LOW
+    // else (Line In) -> HIGH
+    digitalWrite(PIN_RELAY_MUSIC, relayMusicState ? LOW : HIGH);
 
-    // Assumption: 'relayMusicState' (from Controller) == 1 means "Bluetooth Mode Requested".
-    //             'relayMicState' (from Controller) == 1 means "Wireless Mic Requested".
-
-    if (relayMusicState) {
-        // Bluetooth Mode Requested (1)
-        // Hardware: BT is NC -> Write LOW.
-        digitalWrite(PIN_RELAY_MUSIC, LOW); 
-
-        // Start A2DP if not active
-        if (!isBluetoothActive) {
-            Serial.println("Starting Bluetooth...");
-            a2dp_sink.start("Mixer Audio");
-            isBluetoothActive = true;
-        }
-    } else {
-        // Line-In Mode Requested (0)
-        // Hardware: Line is NO -> Write HIGH.
-        digitalWrite(PIN_RELAY_MUSIC, HIGH);
-
-        // Stop A2DP
-        if (isBluetoothActive) {
-            Serial.println("Stopping Bluetooth...");
-            a2dp_sink.end(); 
-            isBluetoothActive = false;
-        }
-    }
-
-    // Mic Relay
-    // 1 = Wireless (NO) -> HIGH
-    // 0 = Wired (NC) -> LOW
+    // Mic Relay Logic from Production:
+    // if relayMicState (Wireless requested) -> HIGH
+    // else (Wired) -> LOW
     digitalWrite(PIN_RELAY_MIC, relayMicState ? HIGH : LOW);
+
+    Serial.printf("[RELAY UPDATE] Music: %s (Pin %d=%s) | Mic: %s (Pin %d=%s)\n",
+        relayMusicState ? "BLUETOOTH" : "LINE-IN", 
+        PIN_RELAY_MUSIC, relayMusicState ? "LOW" : "HIGH",
+        relayMicState ? "WIRELESS" : "WIRED",
+        PIN_RELAY_MIC, relayMicState ? "HIGH" : "LOW");
 }
 
-void updateVolume() {
-    volMusic.setVolume(currentMusicVol);
-    volMic.setVolume(currentMicVol);
-}
+void processRs485Packet(String& input) {
+    Serial.print("[RS485 RAW]: ");
+    Serial.println(input);
 
-void processPacket(String& input) {
-    // Parse JSON
-    // Expected: {"mv":80, "cv":50, "mr":1, "cr":0}
     StaticJsonDocument<200> doc;
     DeserializationError error = deserializeJson(doc, input);
 
     if (error) {
-        Serial.print("JSON Error: ");
+        Serial.print("[JSON ERROR]: ");
         Serial.println(error.c_str());
         return;
     }
-    
-    // Valid packet received -> Reset Timeout
-    extern unsigned long lastPacketTime;
-    lastPacketTime = millis();
 
-    if (doc.containsKey("mv")) currentMusicVol = doc["mv"];
-    if (doc.containsKey("cv")) currentMicVol = doc["cv"];
+    // Update State if keys exist
     if (doc.containsKey("mr")) relayMusicState = doc["mr"] == 1;
     if (doc.containsKey("cr")) relayMicState = doc["cr"] == 1;
-
-    Serial.printf("Upd: MusV=%d MicV=%d MusR=%d MicR=%d\n", 
-                  currentMusicVol, currentMicVol, relayMusicState, relayMicState);
+    
+    // Log Volumes if present (No action taken as analog is disabled)
+    if (doc.containsKey("mv")) {
+        Serial.printf("[VOL] Music: %d (Ignored)\n", (int)doc["mv"]);
+    }
+    if (doc.containsKey("cv")) {
+        Serial.printf("[VOL] Mic: %d (Ignored)\n", (int)doc["cv"]);
+    }
 
     updateRelays();
-    updateVolume();
+}
+
+void processUsbCommand(char c) {
+    switch (c) {
+        case 'm':
+            relayMusicState = !relayMusicState;
+            Serial.println("[MANUAL] Toggled Music Relay");
+            updateRelays();
+            break;
+        case 'c':
+            relayMicState = !relayMicState;
+            Serial.println("[MANUAL] Toggled Mic Relay");
+            updateRelays();
+            break;
+        case '?':
+            Serial.println("[HELP] m=Toggle Music, c=Toggle Mic");
+            updateRelays(); // Show current state
+            break;
+    }
 }
 
 // ------------------- SETUP -------------------
 void setup() {
-    // Debug Serial
     Serial.begin(115200);
-    Serial.println("Mixer Body Booting...");
+    Serial.println("\n\n--- MIXER BODY TEST FIRMWARE ---");
+    Serial.println("Commands: 'm' = Toggle Music Relay, 'c' = Toggle Mic Relay");
 
     // Init Relays
     pinMode(PIN_RELAY_MUSIC, OUTPUT);
     pinMode(PIN_RELAY_MIC, OUTPUT);
-    digitalWrite(PIN_RELAY_MUSIC, LOW);
-    digitalWrite(PIN_RELAY_MIC, LOW);
+    
+    // Set Initial State (Default: Line-In, Wired)
+    relayMusicState = false; 
+    relayMicState = false;
+    updateRelays();
 
     // Init RS485
-    // Use Serial2 (RX=16, TX=17 is Standard for U2 on ESP32 sometimes, but we map explicitly)
     Serial2.begin(115200, SERIAL_8N1, RS485_RX, RS485_TX);
     pinMode(RS485_DE, OUTPUT);
-    digitalWrite(RS485_DE, LOW); // Listen mode default
-
-    // Init Volume Drivers
-    volMusic.begin();
-    volMic.begin();
-
-    // Init A2DP (Config only)
-    i2s_pin_config_t my_pin_config = {
-        .bck_io_num = I2S_BCK,
-        .ws_io_num = I2S_LRCK,
-        .data_out_num = I2S_DOUT,
-        .data_in_num = I2S_PIN_NO_CHANGE
-    };
-    a2dp_sink.set_pin_config(my_pin_config);
-    a2dp_sink.set_auto_reconnect(false); // No PIN code flow / Simple Secure Pairing
-    // a2dp_sink.set_volume(127); // Max Digital Volume, we control Analog.
-    
-    // Supposedly "No Tones" is default for this lib unless audio clips are provided?
-    // Or we might need to silence connection events if they exist.
-    // The lib doesn't play tones by default unless callbacks do it.
-
-    Serial.println("Ready. Requesting state from controller...");
-    
-    // Send request for update to Controller (Screen)
-    // IMPORTANT: Switch RS485 to TX mode briefly
-    digitalWrite(RS485_DE, HIGH);
-    Serial2.println("?"); // Controller listens for "?" or "get"
-    Serial2.flush();     // Wait for transmission
-    digitalWrite(RS485_DE, LOW); // Back to Listen
+    digitalWrite(RS485_DE, LOW); // Rx Mode
 }
 
 // ------------------- LOOP -------------------
 void loop() {
-    // Handle Bluetooth (Managed by Tasks usually, but `handle` might be needed if not using RTOS mode - Lib uses Tasks)
-    // No loop handler needed for A2DP Sink usually.
-
-    // Handle RS485
+    // 1. Check RS485 (From Screen)
     if (Serial2.available()) {
         String input = Serial2.readStringUntil('\n');
         input.trim();
         if (input.length() > 0) {
-            processPacket(input);
+            processRs485Packet(input);
         }
     }
-    
-    // Timeout Check (System OFF logic)
-    // If no packet from screen for > 60 seconds (Increased for Safety), assume screen is OFF.
-    if (isBluetoothActive && (millis() - lastPacketTime > 60000)) {
-        Serial.println("Timeout: Screen OFF (No Heartbeat). Stopping Bluetooth.");
-        a2dp_sink.end();
-        isBluetoothActive = false;
-        
-        // Optional: Switch relay to line-in safely?
-        // digitalWrite(PIN_RELAY_MUSIC, HIGH); 
+
+    // 2. Check USB Serial (Manual Debug)
+    if (Serial.available()) {
+        char c = Serial.read();
+        // Ignore newlines/spaces
+        if (c != '\n' && c != '\r' && c != ' ') {
+            processUsbCommand(c);
+        }
     }
 
     delay(10);

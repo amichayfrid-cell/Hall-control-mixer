@@ -52,3 +52,4 @@
 void bsp_init();
 void bsp_display_flush(lv_disp_drv_t * disp, const lv_area_t * area, lv_color_t * color_p);
 void bsp_touch_read(lv_indev_drv_t * indriver, lv_indev_data_t * data);
+int bsp_get_input_state();
