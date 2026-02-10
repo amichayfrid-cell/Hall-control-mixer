@@ -10,7 +10,7 @@ void AppDataManager::begin() {
     loadState();
     
     // Initialize RS485
-    Serial1.begin(115200, SERIAL_8N1, 16, 15); // RX=16, TX=15
+    Serial1.begin(115200, SERIAL_8N1, 43, 44); // RX=43, TX=44
 }
 
 void AppDataManager::saveState() {

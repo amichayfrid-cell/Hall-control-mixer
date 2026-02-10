@@ -1,182 +1,347 @@
 #include "bsp.h"
+#include <Arduino.h>
+#include <esp_display_panel.hpp>
+#include <lvgl.h>
 #include <Wire.h>
-#include <Arduino_GFX_Library.h>
+#include "TAMC_GT911.h"
 
-// TAMC_GT911 ts(TOUCH_SDA, TOUCH_SCL, TOUCH_INT, TOUCH_RST, TOUCH_WIDTH, TOUCH_HEIGHT);
-// We will call begin(addr) later settings
-TAMC_GT911 ts(TOUCH_SDA, TOUCH_SCL, TOUCH_INT, TOUCH_RST, TOUCH_WIDTH, TOUCH_HEIGHT); 
+using namespace esp_panel::drivers;
 
+LCD *lcd = nullptr;
+Touch *touch = nullptr;
+bool is_lcd_ready = false;
 
-// Timing parameters for Waveshare 4.3B (800x480)
-// Timing parameters for Waveshare 4.3B (800x480)
-// Timing parameters for Waveshare 4.3B (800x480)
-// "Stable Rock" Config:
-// 1. PCLK 12MHz (Lowest Safe Speed to guarantee NO jitter)
-// 2. Official Timings (8/4/8) for correct centering
-// 3. Inverted Phase (For signal stability)
-Arduino_ESP32RGBPanel *bus = new Arduino_ESP32RGBPanel(
-    LCD_DE, LCD_VSYNC, LCD_HSYNC, LCD_PCLK,
-    LCD_R0, LCD_R1, LCD_R2, LCD_R3, LCD_R4,
-    LCD_G0, LCD_G1, LCD_G2, LCD_G3, LCD_G4, LCD_G5,
-    LCD_B0, LCD_B1, LCD_B2, LCD_B3, LCD_B4,
-    0, 8, 4, 8,    // HSYNC Polarity 0, HFP=8, HPW=4, HBP=8
-    0, 8, 4, 8,    // VSYNC Polarity 0, VFP=8, VPW=4, VBP=8
-    1, 12000000, 0, // PCLK 12MHz (Sacrificing FPS for 100% Stability)
-    1, 0); // pclk_active_neg = 1
+// Touch & I2C Objects
+TAMC_GT911 ts = TAMC_GT911(TOUCH_SDA, TOUCH_SCL, TOUCH_INT, TOUCH_RST, TOUCH_WIDTH, TOUCH_HEIGHT);
 
-Arduino_RGB_Display *gfx = new Arduino_RGB_Display(
-    TOUCH_WIDTH, TOUCH_HEIGHT, bus);
+// CH422G Register "Addresses" (Effective I2C Addresses)
+#define CH422G_REG_SET 0x24 
+#define CH422G_REG_IO  0x38 
 
-// Helper to enable backlight via I2C (CH422G)
-// CH422G Protocol:
-// 1. Enable Output Mode: Write 0x01 to Register 0x24
-// 2. Set Pins High: Write 0xFF to Register 0x38 (or 0x26 for input?)
-// Note: On Arduino Wire, beginTransmission(addr) takes the 7-bit addr.
-// So to write to "Register 0x24", we assume the device responds at 0x24.
-// To write to "Register 0x38", we assume it responds at 0x38.
-// Helper to reset Touch via CH422G while controlling INT (GPIO 4) to set address
-void reset_touch() {
-    Serial.println("Performing Hardware Reset on Touch...");
-    
-    // 1. Prepare INT pin (GPIO 4) to set I2C Address
-    // If INT=HIGH during Reset Rising Edge -> Address 0x5D
-    // If INT=LOW  during Reset Rising Edge -> Address 0x14
-    pinMode(TOUCH_INT, OUTPUT);
-    digitalWrite(TOUCH_INT, HIGH); // We aim for 0x5D
-    
-    // 2. Enable CH422G Output Mode (if not already)
-    Wire.beginTransmission(0x24);
-    Wire.write(0x01);
-    Wire.endTransmission();
-    
-    // 3. Hold Reset LOW (via CH422G)
-    // Writing 0x00 to 0x38 sets all pins LOW (Backlight off, Reset Active)
-    Wire.beginTransmission(0x38);
-    Wire.write(0x00);
-    Wire.endTransmission();
-    delay(20);
-    
-    // 4. Release Reset HIGH (via CH422G)
-    // Writing 0xFF to 0x38 sets all pins HIGH (Backlight On, Reset Released)
-    Wire.beginTransmission(0x38);
-    Wire.write(0xFF);
-    Wire.endTransmission();
-    delay(10);
-    
-    // 5. Release INT pin (return to input for driver usage)
-    digitalWrite(TOUCH_INT, LOW); // Optional
-    pinMode(TOUCH_INT, INPUT);
-    delay(200); // Allow GT911 to boot
-    
-    Serial.println("Touch Reset Complete.");
+// =============================================================================
+// Manufacturer Demo Logic (Ported from lvgl_v8_port.cpp)
+// =============================================================================
+
+// Helper for pixel copying
+__attribute__((always_inline))
+static inline void copy_pixel_16bpp(uint8_t *to, const uint8_t *from)
+{
+    *(uint16_t *)to++ = *(const uint16_t *)from++;
 }
 
-void enable_backlight() {
-    // Just ensure outputs are High (Backlight On) without full reset cycle if needed later
-    Wire.beginTransmission(0x38);
-    Wire.write(0xFF);
-    Wire.endTransmission();
-}
+#define COPY_PIXEL(_bpp, to, from)  copy_pixel_16bpp(to, from)
 
-void bsp_init() {
-    Serial.println("BSP Init...");
-    
-    // Initialize I2C
-    Wire.begin(TOUCH_SDA, TOUCH_SCL);
-    // Wire.setClock(100000); // CH422G works fine at 100k
-    
-    // --- TOUCH HARDWARE RESET ---
-    reset_touch();
+// Rotation/Copy Logic (Simplified for 0 degree)
+__attribute__((always_inline))
+IRAM_ATTR static inline void rotate_copy_pixel(
+    const uint8_t *from, uint8_t *to, uint16_t x_start, uint16_t y_start, uint16_t x_end, uint16_t y_end, uint16_t w,
+    uint16_t h, uint16_t rotate
+)
+{
+    int from_bytes_per_piexl = sizeof(lv_color_t);
+    int from_bytes_per_line = w * from_bytes_per_piexl;
+    int from_index = 0;
 
-    // Debug: Scan again to see if 0x5D or 0x14 appeared
-    Serial.println("Scanning I2C for Touch...");
-    int touch_addr = 0;
-    for (byte i = 0x10; i < 0x60; i++) {
-        Wire.beginTransmission(i);
-        if (Wire.endTransmission() == 0) {
-            if(i == 0x5D || i == 0x14) {
-                 Serial.printf("Found Touch at: 0x%02X\n", i);
-                 touch_addr = i;
-            }
+    int to_bytes_per_piexl = 16 >> 3; // RGB565
+    int to_bytes_per_line = w * to_bytes_per_piexl;
+    int to_index_const = (h - 1) * to_bytes_per_line + (w - x_start - 1) * to_bytes_per_piexl;
+    int to_index = 0;
+
+    // Direct Copy (0 Degree)
+    int from_index_const = x_start * from_bytes_per_piexl;
+    to_index_const = x_start * to_bytes_per_line;
+    for (int from_y = y_start; from_y < y_end + 1; from_y++) {
+        from_index = from_y * from_bytes_per_line + from_index_const;
+        to_index = to_index_const + from_y * to_bytes_per_line;
+        for (int from_x = x_start; from_x < x_end + 1; from_x++) {
+             COPY_PIXEL(16, to + to_index, from + from_index);
+             from_index += from_bytes_per_piexl;
+             to_index += to_bytes_per_piexl;
         }
     }
+}
 
-    // Initialize Touch
-    if (touch_addr == 0) {
-        Serial.println("WARNING: Touch device not found after reset! Defaulting to 0x5D.");
-        touch_addr = 0x5D;
+// Dirty Area Tracking for Direct Mode
+typedef struct {
+    uint16_t inv_p;
+    uint8_t inv_area_joined[LV_INV_BUF_SIZE];
+    lv_area_t inv_areas[LV_INV_BUF_SIZE];
+} lv_port_dirty_area_t;
+
+static lv_port_dirty_area_t dirty_area;
+
+static void flush_dirty_save(lv_port_dirty_area_t *dirty_area)
+{
+    lv_disp_t *disp = _lv_refr_get_disp_refreshing();
+    dirty_area->inv_p = disp->inv_p;
+    for (int i = 0; i < disp->inv_p; i++) {
+        dirty_area->inv_area_joined[i] = disp->inv_area_joined[i];
+        dirty_area->inv_areas[i] = disp->inv_areas[i];
     }
-    
-    ts.begin(touch_addr); 
-    ts.setRotation(ROTATION_NORMAL);
-    
-    // Explicitly read once to clear state
-    ts.read();
-    Serial.println("Touch Driver Initialized.");
-
-    // Initialize Display
-    Serial.println("Init Display...");
-    gfx->begin();
-    // gfx->fillScreen(RED); // Red screen removed
-    
-    // Ensure backlight is on again
-    enable_backlight();
-    
-    Serial.println("Display Init Done.");
 }
 
-void bsp_display_flush(lv_disp_drv_t * disp, const lv_area_t * area, lv_color_t * color_p) {
-    uint32_t w = (area->x2 - area->x1 + 1);
-    uint32_t h = (area->y2 - area->y1 + 1);
-    gfx->draw16bitRGBBitmap(area->x1, area->y1, (uint16_t *) color_p, w, h);
-    lv_disp_flush_ready(disp);
+typedef enum {
+    FLUSH_STATUS_PART,
+    FLUSH_STATUS_FULL
+} lv_port_flush_status_t;
+
+typedef enum {
+    FLUSH_PROBE_PART_COPY,
+    FLUSH_PROBE_SKIP_COPY,
+    FLUSH_PROBE_FULL_COPY,
+} lv_port_flush_probe_t;
+
+static lv_port_flush_probe_t flush_copy_probe(lv_disp_drv_t *drv)
+{
+    static lv_port_flush_status_t prev_status = FLUSH_STATUS_PART;
+    lv_port_flush_status_t cur_status;
+    lv_port_flush_probe_t probe_result;
+    lv_disp_t *disp_refr = _lv_refr_get_disp_refreshing();
+
+    uint32_t flush_ver = 0;
+    uint32_t flush_hor = 0;
+    for (int i = 0; i < disp_refr->inv_p; i++) {
+        if (disp_refr->inv_area_joined[i] == 0) {
+            flush_ver = (disp_refr->inv_areas[i].y2 + 1 - disp_refr->inv_areas[i].y1);
+            flush_hor = (disp_refr->inv_areas[i].x2 + 1 - disp_refr->inv_areas[i].x1);
+            break;
+        }
+    }
+    cur_status = ((flush_ver == drv->ver_res) && (flush_hor == drv->hor_res)) ? (FLUSH_STATUS_FULL) : (FLUSH_STATUS_PART);
+
+    if (prev_status == FLUSH_STATUS_FULL) {
+        if ((cur_status == FLUSH_STATUS_PART)) {
+            probe_result = FLUSH_PROBE_FULL_COPY;
+        } else {
+            probe_result = FLUSH_PROBE_SKIP_COPY;
+        }
+    } else {
+        probe_result = FLUSH_PROBE_PART_COPY;
+    }
+    prev_status = cur_status;
+
+    return probe_result;
 }
 
-void bsp_touch_read(lv_indev_drv_t * indriver, lv_indev_data_t * data) {
+static void *get_next_frame_buffer(LCD *lcd)
+{
+    static void *next_fb = NULL;
+    static void *fbs[2] = { NULL };
+
+    if (next_fb == NULL) {
+        fbs[0] = lcd->getFrameBufferByIndex(0);
+        fbs[1] = lcd->getFrameBufferByIndex(1);
+        next_fb = fbs[1];
+    } else {
+        next_fb = (next_fb == fbs[0]) ? fbs[1] : fbs[0];
+    }
+
+    return next_fb;
+}
+
+static inline void *flush_get_next_buf(LCD *lcd)
+{
+    return get_next_frame_buffer(lcd);
+}
+
+static void flush_dirty_copy(void *dst, void *src, lv_port_dirty_area_t *dirty_area)
+{
+    lv_coord_t x_start, x_end, y_start, y_end;
+    for (int i = 0; i < dirty_area->inv_p; i++) {
+        if (dirty_area->inv_area_joined[i] == 0) {
+            x_start = dirty_area->inv_areas[i].x1;
+            x_end = dirty_area->inv_areas[i].x2;
+            y_start = dirty_area->inv_areas[i].y1;
+            y_end = dirty_area->inv_areas[i].y2;
+
+            rotate_copy_pixel(
+                (uint8_t *)src, (uint8_t *)dst, x_start, y_start, x_end, y_end, TOUCH_WIDTH, TOUCH_HEIGHT, 0
+            );
+        }
+    }
+}
+
+// SIMPLIFIED FLUSH CALLBACK (Stability First)
+static void bsp_flush_callback(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_map)
+{
+    // In Direct Mode + Full Refresh:
+    // color_map points to the framebuffer we just drew into.
+    // We simply check if it's the last part of the flush (always is for full refresh)
+    // and switch the LCD to display this buffer.
+    
+    if (lv_disp_flush_is_last(drv)) {
+        lcd->switchFrameBufferTo(color_map);
+    }
+
+    lv_disp_flush_ready(drv);
+}
+
+// =============================================================================
+// BSP Init
+// =============================================================================
+
+void bsp_init_display() {
+    BusRGB::RefreshPanelPartialConfig refresh_config;
+    
+    refresh_config.pclk_gpio_num = LCD_PCLK;
+    refresh_config.hsync_gpio_num = LCD_HSYNC;
+    refresh_config.vsync_gpio_num = LCD_VSYNC;
+    refresh_config.de_gpio_num = LCD_DE;
+    refresh_config.disp_gpio_num = -1;
+    
+    refresh_config.data_gpio_nums[0] = LCD_B0;
+    refresh_config.data_gpio_nums[1] = LCD_B1;
+    refresh_config.data_gpio_nums[2] = LCD_B2;
+    refresh_config.data_gpio_nums[3] = LCD_B3;
+    refresh_config.data_gpio_nums[4] = LCD_B4;
+    
+    refresh_config.data_gpio_nums[5] = LCD_G0;
+    refresh_config.data_gpio_nums[6] = LCD_G1;
+    refresh_config.data_gpio_nums[7] = LCD_G2;
+    refresh_config.data_gpio_nums[8] = LCD_G3;
+    refresh_config.data_gpio_nums[9] = LCD_G4;
+    refresh_config.data_gpio_nums[10] = LCD_G5;
+    
+    refresh_config.data_gpio_nums[11] = LCD_R0;
+    refresh_config.data_gpio_nums[12] = LCD_R1;
+    refresh_config.data_gpio_nums[13] = LCD_R2;
+    refresh_config.data_gpio_nums[14] = LCD_R3;
+    refresh_config.data_gpio_nums[15] = LCD_R4;
+
+    // Timing
+    refresh_config.pclk_hz = LCD_TIMING_FREQ_HZ;
+    refresh_config.h_res = TOUCH_WIDTH;
+    refresh_config.v_res = TOUCH_HEIGHT;
+    refresh_config.hsync_pulse_width = LCD_TIMING_HPW;
+    refresh_config.hsync_back_porch = LCD_TIMING_HBP;
+    refresh_config.hsync_front_porch = LCD_TIMING_HFP;
+    refresh_config.vsync_pulse_width = LCD_TIMING_VPW;
+    refresh_config.vsync_back_porch = LCD_TIMING_VBP;
+    refresh_config.vsync_front_porch = LCD_TIMING_VFP;
+    
+    refresh_config.flags_pclk_active_neg = true; 
+    refresh_config.bounce_buffer_size_px = LCD_BOUNCE_BUFFER_SIZE;
+
+    // Create Main Bus Config and assign the partial config
+    BusRGB::Config bus_config;
+    bus_config.refresh_panel = refresh_config;
+
+    // LCD Config
+    LCD::DevicePartialConfig device_config;
+    device_config.bits_per_pixel = 16;
+    
+    LCD::Config lcd_config;
+    lcd_config.device = device_config;
+
+    // Create Driver
+    lcd = new LCD_ST7262(bus_config, lcd_config);
+    lcd->configFrameBufferNumber(2);
+
+    if (!lcd->init()) { Serial.println("LCD Init Fail"); return; }
+    if (!lcd->begin()) { Serial.println("LCD Begin Fail"); return; }
+    
+    gpio_set_drive_capability((gpio_num_t)LCD_PCLK, GPIO_DRIVE_CAP_3);
+    lcd->setDisplayOnOff(true);
+    is_lcd_ready = true;
+}
+
+void bsp_lvgl_port_init() {
+    static lv_disp_draw_buf_t draw_buf;
+    void *buf1 = lcd->getFrameBufferByIndex(0);
+    void *buf2 = lcd->getFrameBufferByIndex(1);
+    
+    lv_disp_draw_buf_init(&draw_buf, (lv_color_t*)buf1, (lv_color_t*)buf2, TOUCH_WIDTH * TOUCH_HEIGHT);
+    
+    static lv_disp_drv_t disp_drv;
+    lv_disp_drv_init(&disp_drv);
+    
+    disp_drv.hor_res = TOUCH_WIDTH;
+    disp_drv.ver_res = TOUCH_HEIGHT;
+    disp_drv.flush_cb = bsp_flush_callback; 
+    disp_drv.draw_buf = &draw_buf;
+    disp_drv.user_data = (void *)lcd;
+    // Simplified Mode: Direct + Full Refresh (Ping Pong)
+    disp_drv.direct_mode = 1;
+    disp_drv.full_refresh = 1;
+    
+    lv_disp_drv_register(&disp_drv);
+}
+
+// CH422G I2C Helper
+void ch422g_write(uint8_t addr_cmd, uint8_t data) {
+    Wire.beginTransmission(addr_cmd);
+    Wire.write(data);
+    Wire.endTransmission();
+}
+
+void bsp_set_backlight(bool on) {
+    // CH422G IO 2 Control
+    // To set Output, we write to REG_IO (0x38).
+    // We need to preserve other bits?
+    // Since we don't track state, we'll just assume "ON" means setting Bit 2.
+    // And "Reset" pins (1 and 3) should be High (Inactive) during operations.
+    // So 0xFF is safe. 
+    // If OFF: Clear Bit 2? -> 0xFB.
+    // However, during init we set everything to 0xFF.
+    // So for ON, we just write 0xFF (Simple).
+    if (on) {
+        ch422g_write(CH422G_REG_IO, 0xFF);
+    } else {
+        ch422g_write(CH422G_REG_IO, 0xFB); // Clear Bit 2
+    }
+}
+
+int bsp_get_input_state() {
+    // Crude implementation
+    return 1;
+}
+
+void bsp_touch_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data) {
     ts.read();
     if (ts.isTouched) {
         data->state = LV_INDEV_STATE_PR;
-        // Manual Calibration: Invert Both Axes (180 degree rotation)
-        data->point.x = TOUCH_WIDTH - ts.points[0].x;
-        data->point.y = TOUCH_HEIGHT - ts.points[0].y;
-        
-        /*
-        Serial.printf("Touch Raw: %d,%d -> Mapped: %d,%d\n", 
-            ts.points[0].x, ts.points[0].y, data->point.x, data->point.y);
-        */
-        data->state = LV_INDEV_STATE_REL;
-        // Serial.println("Touch: None");
-    }
-}
-
-// Read CH422G Input Register (0x26)
-// Returns the full byte. 
-// DI0 is likely Bit 0 or Bit something. 
-// Based on docs: EXIO0 is DI0.
-int bsp_get_input_state() {
-    Wire.beginTransmission(0x24); // CH422G Address
-    Wire.write(0x26);             // Input Register Command
-    if (Wire.endTransmission() != 0) {
-        return -1; // Error
-    }
-    
-    Wire.requestFrom(0x24, 1);
-    if (Wire.available()) {
-        return Wire.read();
-    }
-    return -1;
-}
-
-// Control Backlight via CH422G (Bit 4 of Enable Register?)
-// Actually, earlier in code we saw: enable_backlight() uses specific command.
-// See enable_backlight implementation above (it was static/hidden?).
-// Let's expose it.
-void bsp_set_backlight(bool on) {
-    Wire.beginTransmission(0x38);
-    if (on) {
-        Wire.write(0xFF); // All Pins HIGH (Backlight ON, Touch Reset Released)
+        data->point.x = ts.points[0].x;
+        data->point.y = ts.points[0].y;
     } else {
-        Wire.write(0x00); // All Pins LOW (Backlight OFF, Touch held in Reset)
+        data->state = LV_INDEV_STATE_REL;
     }
-    Wire.endTransmission();
+}
+
+// Global Init Wrapper
+void bsp_init() {
+    // 1. I2C Init for Touch and Expander
+    Wire.begin(TOUCH_SDA, TOUCH_SCL);
+    delay(10);
+
+    // 2. Init IO Expander (CH422G)
+    // Enable Output Mode (REG_SET = 0x01) via Address 0x24
+    ch422g_write(CH422G_REG_SET, 0x01);
+    
+    // 3. Reset Sequence for LCD and Touch
+    // We need to toggle LCD_RST (IO3) and TP_RST (IO1).
+    // Backlight (IO2) should be ON (High) ideally, or we can enable it later.
+    // Let's hold Reset (Low) for 10ms.
+    // Pattern: IO3=0, IO1=0. IO2=1 (BL ON). Result: 0xF5 (1111 0101)
+    ch422g_write(CH422G_REG_IO, 0xF5); 
+    delay(20);
+    
+    // Release Reset (High). All High = 0xFF.
+    ch422g_write(CH422G_REG_IO, 0xFF);
+    delay(200);
+
+    // 4. Init Touch (Now that it's out of reset)
+    ts.begin();
+    ts.setRotation(ROTATION_INVERTED);
+
+    // 5. Init Display
+    bsp_init_display();
+}
+
+void *bsp_get_frame_buffer(uint8_t index) {
+    if (lcd && is_lcd_ready) return lcd->getFrameBufferByIndex(index);
+    return nullptr;
+}
+
+void bsp_display_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p) {
+    lv_disp_flush_ready(disp);
 }
