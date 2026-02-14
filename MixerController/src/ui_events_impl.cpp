@@ -40,7 +40,7 @@ void mic_mode_toggle(lv_event_t * e) {
         AppData.sendUpdate();
         
         // 4. Wait for receiver to process volume drop
-        delay(50);
+        vTaskDelay(pdMS_TO_TICKS(50));
         
         // 5. Toggle Relay
         AppData.mic_relay_state = !AppData.mic_relay_state;
@@ -63,7 +63,7 @@ void mic_mode_toggle(lv_event_t * e) {
         AppData.sendUpdate();
         
         // 4. Wait
-        delay(50);
+        vTaskDelay(pdMS_TO_TICKS(50));
         
         // 5. Toggle Relay
         AppData.music_relay_state = !AppData.music_relay_state;

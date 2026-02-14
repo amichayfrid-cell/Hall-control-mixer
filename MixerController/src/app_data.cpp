@@ -31,7 +31,7 @@ void AppDataManager::loadState() {
 
 void AppDataManager::sendUpdate() {
     sendJSON();
-    saveState();
+    dirty = true;  // Will be saved by throttled save in main loop
 }
 
 void AppDataManager::sendJSON() {

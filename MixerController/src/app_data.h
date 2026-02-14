@@ -10,6 +10,7 @@ public:
     int main_fader = 100; // 0-100 percentage
     bool music_relay_state = true;
     bool mic_relay_state = true;
+    bool dirty = false;  // Set true when values change, cleared after save
 
     void begin();
     void saveState();
