@@ -34,6 +34,7 @@ bool relayMicState = false;   // logic from Controller
 
 // Bluetooth State
 bool isBluetoothActive = false;
+bool systemSleeping = false;  // Set true when pwr:0 received
 
 // ------------------- PT2258 DRIVER -------------------
 void pt2258_write(byte data) {
@@ -130,6 +131,38 @@ void processPacket(String& input) {
         Serial.print("JSON Error: ");
         Serial.println(error.c_str());
         return;
+    }
+    
+    // --- SHUTDOWN COMMAND ---
+    if (doc.containsKey("pwr") && doc["pwr"] == 0) {
+        Serial.println(">>> SHUTDOWN command received <<<");
+        
+        // 1. Mute all volume channels
+        currentMusicVol = 0;
+        currentMicVol = 0;
+        updateVolume();
+        
+        // 2. Stop Bluetooth
+        if (isBluetoothActive) {
+            Serial.println("Stopping Bluetooth (shutdown)...");
+            a2dp_sink.end();
+            isBluetoothActive = false;
+        }
+        
+        // 3. Reset relays to default (Line-In, Wired Mic)
+        relayMusicState = false;
+        relayMicState = false;
+        updateRelays();
+        
+        systemSleeping = true;
+        Serial.println("System sleeping. Waiting for heartbeat to wake up.");
+        return;
+    }
+    
+    // --- NORMAL COMMAND (heartbeat / manual) ---
+    if (systemSleeping) {
+        Serial.println(">>> WAKE UP: Heartbeat received <<<");
+        systemSleeping = false;
     }
     
     if (doc.containsKey("mv")) currentMusicVol = doc["mv"];

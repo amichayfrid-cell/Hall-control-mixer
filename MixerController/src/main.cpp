@@ -1,8 +1,12 @@
 #include <Arduino.h>
 #include <lvgl.h>
+#include <ArduinoJson.h>
 #include "ui/ui.h"
 #include "bsp.h"
 #include "app_data.h"
+
+// Defined in ui_events_impl.cpp
+extern void ui_screen2_add_power_toggle(void);
 
 void setup() {
     Serial.begin(115200);
@@ -23,6 +27,7 @@ void setup() {
     bsp_lvgl_lock(-1);
     ui_init();
     AppData.syncUI();
+    ui_screen2_add_power_toggle();  // Add power sensing toggle to Screen 2
     bsp_lvgl_unlock();
 
     Serial.println("=== Setup Complete ===");
@@ -42,46 +47,61 @@ void loop() {
         last_heartbeat = millis();
         
         // --- POWER SENSING LOGIC (USB CHARGER on DI0) ---
-        int input_reg = bsp_get_input_state();
-        
-        static bool system_was_on = true;
-        static int debounce_counter = 0;
-        
-        if (input_reg != -1) {
-            bool switch_is_on = (input_reg & 0x01);
+        // When charger disconnects, wait 15 seconds before shutting down
+        // so the user can navigate to Screen 2 and disable if needed
+        if (AppData.power_sensing_enabled) {
+            int input_reg = bsp_get_input_state();
             
-            if (switch_is_on) {
-                if (!system_was_on) {
-                    debounce_counter++;
-                    if (debounce_counter > 0) {
+            static bool system_was_on = true;
+            static unsigned long shutdown_timer_start = 0;
+            static bool shutdown_pending = false;
+            
+            if (input_reg != -1) {
+                bool switch_is_on = (input_reg & 0x01);
+                
+                if (switch_is_on) {
+                    // Power ON detected
+                    if (shutdown_pending) {
+                        Serial.println("Power: Charger reconnected, cancelling shutdown.");
+                        shutdown_pending = false;
+                    }
+                    if (!system_was_on) {
                         Serial.println("Power: Switch ON detected. Waking up.");
                         bsp_set_backlight(true);
                         
-                        // Show loading screen, then transition to main screen
                         bsp_lvgl_lock(-1);
                         _ui_screen_change(&ui_Screen3, LV_SCR_LOAD_ANIM_NONE, 0, 0, &ui_Screen3_screen_init);
                         bsp_lvgl_unlock();
                         
                         system_was_on = true;
-                        debounce_counter = 0;
                         AppData.sendUpdate();
                     }
                 } else {
-                    debounce_counter = 0;
-                }
-            } else {
-                if (system_was_on) {
-                    debounce_counter++;
-                    if (debounce_counter > 0) {
-                        Serial.println("Power: Switch OFF detected. Shutting down.");
+                    // Power OFF detected
+                    if (system_was_on && !shutdown_pending) {
+                        // Start 15-second countdown
+                        shutdown_pending = true;
+                        shutdown_timer_start = millis();
+                        Serial.println("Power: Charger disconnected. Shutting down in 15 seconds...");
+                    }
+                    
+                    if (shutdown_pending && (millis() - shutdown_timer_start > 15000)) {
+                        // 15 seconds passed — execute shutdown
+                        Serial.println("Power: Shutdown timer expired. Turning off.");
                         bsp_set_backlight(false);
                         AppData.music_relay_state = false;
                         AppData.sendUpdate();
+                        
+                        // Send shutdown command to second controller
+                        StaticJsonDocument<64> shutdownDoc;
+                        shutdownDoc["pwr"] = 0;
+                        serializeJson(shutdownDoc, Serial1);
+                        Serial1.println();
+                        Serial.println("RS485 TX: {\"pwr\":0}");
+                        
                         system_was_on = false;
-                        debounce_counter = 0;
+                        shutdown_pending = false;
                     }
-                } else {
-                    debounce_counter = 0;
                 }
             }
         }

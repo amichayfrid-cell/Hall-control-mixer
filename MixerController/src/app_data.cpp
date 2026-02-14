@@ -19,6 +19,7 @@ void AppDataManager::saveState() {
     preferences.putInt("main_f", main_fader);
     preferences.putBool("mus_r", music_relay_state);
     preferences.putBool("mic_r", mic_relay_state);
+    preferences.putBool("pwr_en", power_sensing_enabled);
 }
 
 void AppDataManager::loadState() {
@@ -27,6 +28,7 @@ void AppDataManager::loadState() {
     main_fader = preferences.getInt("main_f", 100);
     music_relay_state = preferences.getBool("mus_r", true);
     mic_relay_state = preferences.getBool("mic_r", true);
+    power_sensing_enabled = preferences.getBool("pwr_en", true);
 }
 
 void AppDataManager::sendUpdate() {
